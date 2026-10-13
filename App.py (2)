@@ -1,0 +1,570 @@
+from flask import (
+    Flask, request, redirect, url_for,
+    session, render_template_string, Response
+)
+from urllib.parse import urlparse
+from ipaddress import ip_address
+from datetime import datetime
+from functools import wraps
+import re
+import os
+import csv
+import io
+from functools import wraps
+import re
+import os
+
+app = Flask(__name__)
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY", "change-this-demo-secret"
+)
+
+# Demo credentials. Change before real deployment.
+DEMO_USER = "admin"
+DEMO_PASSWORD = "Admin@123"
+
+scans = []
+alerts = []
+
+CSV_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "scan_history.csv"
+)
+
+def save_scan_to_csv(scan):
+    needs_header = (
+        not os.path.isfile(CSV_FILE)
+        or os.path.getsize(CSV_FILE) == 0
+    )
+
+    with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+
+        if needs_header:
+            writer.writerow([
+                "Target", "Type", "Risk",
+                "Score", "Reasons", "Scanned At"
+            ])
+
+        writer.writerow([
+            scan.get("target", ""),
+            scan.get("type", ""),
+            scan.get("risk", ""),
+            scan.get("score", ""),
+            "; ".join(scan.get("reasons", [])),
+            scan.get("time", "")
+        ])
+
+PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SecurePulse | Cyber Risk Protection</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; font-family: Arial, sans-serif;
+  background: #0b1120; color: #e5e7eb;
+}
+
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 16px 24px;
+  background: #111c32;
+  border-bottom: 1px solid #263750;
+  width: 100%;
+}
+
+nav a {
+  color: #67e8f9;
+  text-decoration: none;
+  font-size: 16px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: color 0.2s ease;
+}
+
+nav a:hover {
+  color: #ffffff;
+}
+
+main { max-width: 1000px; margin: 30px auto; padding: 16px; }
+.card {
+  background: #172238; padding: 22px; margin: 14px 0;
+  border-radius: 12px; border: 1px solid #334155;
+}
+.grid { display: grid; grid-template-columns:
+repeat(auto-fit,minmax(180px,1fr)); gap: 14px; }
+h1 { color: #67e8f9; }
+input, button {
+  padding: 12px; margin: 6px 0; border-radius: 7px;
+  border: 1px solid #475569; font-size: 15px;
+}
+input { width: 100%; background: #0b1120; color: white; }
+button { background: #0891b2; color: white; cursor: pointer; }
+.muted { color: #94a3b8; }
+.safe { color: #4ade80; }
+.risk { color: #f87171; }
+a { color: #67e8f9; }
+</style>
+</head>
+<body>
+<nav>
+  <img src="{{ url_for('static', filename='securepulse_logo.png') }}"
+       alt="SecurePulse Logo"
+       style="height: 45px; width: 45px; object-fit: contain;">
+  <strong style="color: #67e8f9; font-size: 22px;">SecurePulse</strong>
+
+<a href="{{ url_for('dashboard') }}">Dashboard</a>
+<a href="{{ url_for('history') }}">Scan History</a>
+<a href="{{ url_for('url_scan') }}">Website Scan</a>
+  <a href="{{ url_for('ip_scan') }}">IP Analysis</a>
+  <a href="{{ url_for('threats') }}">Threat Alerts</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+</nav>
+<main>
+{{ content|safe }}
+<p class="muted">SecurePulse | Cyber Risk Protection 
+Educational prototype</p>
+</main>
+</body>
+</html>
+"""
+
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login"))
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def page(content, **context):
+    return render_template_string(
+        PAGE, content=render_template_string(
+            content, **context
+        )
+    )
+
+@app.route("/")
+def home():
+    if session.get("logged_in"):
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    message = ""
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username == DEMO_USER and password == DEMO_PASSWORD:
+            session.clear()
+            session["logged_in"] = True
+            return redirect(url_for("dashboard"))
+        message = "Invalid username or password"
+
+    return page("""
+    <div class="card">
+      <h1>Digital Risk Protection</h1>
+      <h2>Login</h2>
+      <p class="risk">{{ message }}</p>
+      <form method="post">
+        <label>Username</label>
+        <input name="username" required>
+        <label>Password</label>
+        <input name="password" type="password" required>
+        <button type="submit">Login</button>
+      </form>
+      <p class="muted">Demo username: admin</p>
+      <p class="muted">Demo password: Admin@123</p>
+    </div>
+    """, message=message)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/dashboard")
+@login_required
+
+def dashboard():
+    safe = sum(s["risk"] == "Safe" for s in scans)
+    medium = sum(s["risk"] in ["Medium", "Moderate"] for s in scans)
+    high = sum(s["risk"] == "High" for s in scans)
+
+    return page("""
+    <h1>Security Dashboard</h1>
+    <p class="muted">Monitor website and IP risk indicators.</p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Total Scans</h3>
+        <h2>{{ total }}</h2>
+      </div>
+      <div class="card">
+        <h3>Safe Scans</h3>
+        <h2 class="safe">{{ safe }}</h2>
+      </div>
+      <div class="card">
+        <h3>Medium Risk</h3>
+        <h2>{{ medium }}</h2>
+      </div>
+      <div class="card">
+        <h3>High Risk</h3>
+        <h2 class="risk">{{ high }}</h2>
+      </div>
+      <div class="card">
+        <h3>Threat Alerts</h3>
+        <h2>{{ alert_count }}</h2>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Scan Risk Bar Chart</h2>
+      <canvas id="riskChart" height="120"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>Quick Actions</h2>
+      <p><a href="{{ url_for('url_scan') }}">Scan a website URL</a></p>
+      <p><a href="{{ url_for('ip_scan') }}">Analyse an IP address</a></p>
+      <p><a href="{{ url_for('threats') }}">View threat alerts</a></p>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+      new Chart(document.getElementById('riskChart'), {
+        type: 'bar',
+        data: {
+          labels: ['Safe', 'Medium Risk', 'High Risk'],
+          datasets: [{
+            label: 'Number of Scans',
+            data: [{{ safe }}, {{ medium }}, {{ high }}],
+            backgroundColor: ['#4ade80', '#facc15', '#f87171']
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: {
+              beginAtZero: true,
+              ticks: { precision: 0 }
+            }
+          }
+        }
+      });
+    </script>
+    """,
+    total=len(scans),
+    safe=safe,
+    medium=medium,
+    high=high,
+    alert_count=len(alerts))
+
+def analyse_url(value):
+    value = value.strip()
+
+    parsed = urlparse(
+        value if "://" in value else "https://" + value
+    )
+
+    host = parsed.hostname
+
+    if (
+        not host
+        or "." not in host
+        or any(c.isspace() for c in value)
+        or parsed.scheme not in ("http", "https")
+    ):
+        return None
+
+    host = host.lower().rstrip(".")
+    score = 0
+    reasons = []
+
+    # Identify popular social platforms
+    platforms = {
+        "instagram.com": "Instagram",
+        "facebook.com": "Facebook",
+        "fb.com": "Facebook",
+        "fb.watch": "Facebook Watch",
+        "youtube.com": "YouTube",
+        "youtu.be": "YouTube",
+        "tiktok.com": "TikTok",
+        "linkedin.com": "LinkedIn",
+        "x.com": "X (Twitter)",
+        "twitter.com": "X (Twitter)",
+        "reddit.com": "Reddit",
+        "pinterest.com": "Pinterest",
+        "snapchat.com": "Snapchat",
+        "threads.net": "Threads",
+        "twitch.tv": "Twitch",
+        "t.me": "Telegram",
+        "telegram.me": "Telegram",
+        "whatsapp.com": "WhatsApp",
+        "discord.com": "Discord",
+        "github.com": "GitHub",
+    }
+
+    platform = "Other Website"
+
+    for domain, name in platforms.items():
+        if host == domain or host.endswith("." + domain):
+            platform = name
+            break
+
+    # Detect possible lookalike domains
+    brand_domains = {
+        "instagram": "Instagram",
+        "facebook": "Facebook",
+        "youtube": "YouTube",
+        "tiktok": "TikTok",
+        "linkedin": "LinkedIn",
+        "twitter": "X (Twitter)",
+        "pinterest": "Pinterest",
+        "snapchat": "Snapchat",
+        "reddit": "Reddit",
+    }
+
+    if platform == "Other Website":
+        labels = host.split(".")
+
+        for brand, name in brand_domains.items():
+            if any(brand in label for label in labels):
+                score += 2
+                reasons.append(
+                    f"Possible {name} lookalike domain"
+                )
+                break
+
+    # URL-based risk indicators
+    if parsed.scheme != "https":
+        score += 1
+        reasons.append("HTTPS is not used")
+
+    if "@" in parsed.netloc:
+        score += 2
+        reasons.append("URL contains an @ symbol")
+
+    if len(value) > 100:
+        score += 1
+        reasons.append("Unusually long URL")
+
+    if host.count("-") >= 3:
+        score += 1
+        reasons.append("Multiple hyphens in hostname")
+
+    if re.search(
+        r"(login|verify|secure|account|update|password)",
+        value,
+        re.I,
+    ):
+        score += 1
+        reasons.append(
+            "Contains a sensitive-action keyword"
+        )
+
+    if re.fullmatch(
+        r"\d{1,3}(?:\.\d{1,3}){3}",
+        host,
+    ):
+        score += 2
+        reasons.append(
+            "Uses an IP address as the website host"
+        )
+
+    level = (
+        "High" if score >= 3
+        else "Medium" if score >= 1
+        else "Low"
+    )
+
+    if not reasons:
+        reasons.append(
+            "No configured suspicious URL patterns found"
+        )
+
+    return {
+        "target": value,
+        "platform": platform,
+        "risk": level,
+        "score": score,
+        "reasons": reasons,
+    }
+
+@app.route("/scan", methods=["GET", "POST"])
+@login_required
+def url_scan():
+    result = None
+    error = ""
+    if request.method == "POST":
+        value = request.form.get("url", "")
+        result = analyse_url(value)
+        if result is None:
+            error = "Enter a valid domain or website URL."
+        else:
+            result["type"] = "URL"
+            result["time"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            scans.insert(0, result)
+            save_scan_to_csv(result)
+            if result["risk"] == "High":
+                alerts.insert(0, result.copy())
+
+    return page("""
+    <h1>Website Risk Scanner</h1>
+    <div class="card">
+      <form method="post">
+        <label>Website URL</label>
+        <input name="url" placeholder="https://example.com" required>
+        <button type="submit">Analyse URL</button>
+      </form>
+      <p class="risk">{{ error }}</p>
+    </div>
+    {% if result %}
+    <div class="card">
+      <h2>Risk: <span class="{{ 'risk' if result.risk == 'High'
+        else 'safe' }}">{{ result.risk }}</span></h2>
+      <p>Risk score: {{ result.score }}</p>
+      <p><strong>Platform:</strong> {{ result.platform }}</p>
+      <h3>Indicators</h3>
+      <ul>{% for reason in result.reasons %}
+        <li>{{ reason }}</li>
+      {% endfor %}</ul>
+      <p class="muted">Heuristic result only; not a confirmed
+      phishing verdict.</p>
+    </div>
+    {% endif %}
+    """, result=result, error=error)
+
+
+@app.route("/ip", methods=["GET", "POST"])
+@login_required
+def ip_scan():
+    result = None
+    error = ""
+    if request.method == "POST":
+        value = request.form.get("ip", "").strip()
+        try:
+            addr = ip_address(value)
+            result = {
+                "target": str(addr),
+                "version": addr.version,
+                "scope": "Private" if addr.is_private else "Public",
+                "valid": True
+            }
+            item = {
+                "target": str(addr), "type": "IP",
+                "risk": "Informational",
+                "time": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "reasons": ["IP format validated; reputation not checked"]
+            }
+            scans.insert(0, item)
+        except ValueError:
+            error = "Invalid IP address. Try 8.8.8.8"
+
+    return page("""
+    <h1>IP Address Analysis</h1>
+    <div class="card">
+      <form method="post">
+        <label>IPv4 or IPv6 address</label>
+        <input name="ip" placeholder="8.8.8.8" required>
+        <button type="submit">Analyse IP</button>
+      </form>
+      <p class="risk">{{ error }}</p>
+    </div>
+    {% if result %}
+    <div class="card">
+      <h2>IP: {{ result.target }}</h2>
+      <p>IP version: IPv{{ result.version }}</p>
+      <p>Address classification: {{ result.scope }}</p>
+      <p class="muted">This is not a malicious-IP reputation check.</p>
+    </div>
+    {% endif %}
+    """, result=result, error=error)
+
+
+@app.route("/alerts")
+@login_required
+def threats():
+    return page("""
+    <h1>Threat Alerts</h1>
+    {% if items %}
+      {% for item in items %}
+      <div class="card">
+        <h3 class="risk">{{ item.risk }} risk</h3>
+        <p>Target: {{ item.target }}</p>
+        <p>Time: {{ item.time }}</p>
+        <ul>{% for reason in item.reasons %}
+          <li>{{ reason }}</li>
+        {% endfor %}</ul>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="card">No high-risk URL indicators recorded yet.</div>
+    {% endif %}
+    """, items=alerts)
+
+@app.route("/history")
+@login_required
+def history():
+    return page("""
+    <h1>Scan History</h1>
+<a href="{{ url_for('export_csv') }}" class="btn">Export CSV</a>
+    {% if items %}
+      {% for item in items %}
+      <div class="card">
+        <b>{{ item.type }}</b>: {{ item.target }}
+        <p>Result: {{ item.risk }} | Time: {{ item.time }}</p>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="card">No scans yet. Try the website scanner.</div>
+    {% endif %}
+    """, items=scans)
+@app.route("/export.csv")
+@login_required
+def export_csv():
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Target", "Type", "Risk",
+        "Score", "Reasons", "Scanned At"
+    ])
+
+    for scan in scans:
+        writer.writerow([
+            scan.get("target", ""),
+            scan.get("type", ""),
+            scan.get("risk", ""),
+            scan.get("score", ""),
+            "; ".join(scan.get("reasons", [])),
+            scan.get("time", "")
+        ])
+
+    response = Response(
+        "\ufeff" + output.getvalue(),
+        mimetype="text/csv"
+    )
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=scan_history.csv"
+    )
+    return response
+if __name__ == "__main__":
+    print("Starting Flask app...")
+    app.run(debug=True)
